@@ -35,6 +35,8 @@ const CTA_SELECTORS = [
   '[data-pixeo-cta]',
   '.pixeo-cta',
   '#trigger-buy',
+  'a[href="mostrarBoton"]',
+  'img[alt="CTA"]',
   '[data-pixeo-releasit-trigger]',
   '.pixeo-releasit-trigger',
   '[class*="releasit"] button',
@@ -223,7 +225,10 @@ async function boot(): Promise<void> {
       for (const entry of entries) {
         const state = sections.get(entry.target);
         if (!state) continue;
-        if (entry.isIntersecting && entry.intersectionRatio >= 0.25) {
+        if (
+          entry.isIntersecting
+          && (entry.intersectionRatio >= 0.25 || entry.intersectionRect.height >= window.innerHeight * 0.4)
+        ) {
           if (!state.viewed) {
             state.viewed = true;
             const sectionId = entry.target.getAttribute('data-pixeo-item-id')
@@ -237,9 +242,19 @@ async function boot(): Promise<void> {
         }
       }
     },
-    { threshold: [0.25] },
+    { threshold: [0, 0.1, 0.25, 0.5] },
   );
-  for (const section of document.querySelectorAll('[id^="pix-section-"],.image-container[data-pixeo-item-id]')) {
+  // Fallback: si la landing publicada no trae ids, numerar los bloques del contenido.
+  let blockIndex = 0;
+  for (const block of document.querySelectorAll(
+    '.product-landing-content .image-container, .product-landing-content .section-container',
+  )) {
+    blockIndex += 1;
+    if (!block.getAttribute('data-pixeo-item-id') && !block.id.startsWith('pix-section-')) {
+      block.setAttribute('data-pixeo-item-id', `bloque-${blockIndex}`);
+    }
+  }
+  for (const section of document.querySelectorAll('[id^="pix-section-"],[data-pixeo-item-id]')) {
     sections.set(section, { visibleSince: null, totalMs: 0, viewed: false });
     sectionObserver.observe(section);
   }
