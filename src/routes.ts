@@ -34,6 +34,11 @@ interface RouteDependencies {
   trackerBundle: Buffer;
 }
 
+interface BootstrapRow extends QueryResultRow {
+  id: string;
+  public_token: string;
+}
+
 interface PublicationRow extends QueryResultRow {
   id: string;
   shop_domain: string;
@@ -184,6 +189,43 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
       : reply.code(503).send({ status: 'not_ready' });
   });
 
+  app.get('/bootstrap.js', async (request, reply) => {
+    const query = z.object({
+      shop: z.string().trim().min(1).max(253),
+      product_id: z.coerce.string().trim().min(1).max(255),
+    }).strict().safeParse(request.query);
+    if (!query.success) {
+      return reply.code(400).type('application/javascript').send('');
+    }
+
+    let shopDomain: string;
+    try {
+      shopDomain = normalizeShopDomain(query.data.shop);
+    } catch {
+      return reply.code(400).type('application/javascript').send('');
+    }
+
+    const result = await database.query<BootstrapRow>(
+      `SELECT id, public_token
+       FROM insights_deployments
+       WHERE shop_domain = $1 AND product_id = $2 AND active = true
+         AND public_token IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [shopDomain, query.data.product_id],
+    );
+    const deployment = result.rows[0];
+    if (!deployment) {
+      return reply.type('application/javascript').header('Cache-Control', 'no-store').send('');
+    }
+
+    const script = `(function(){var s=document.createElement('script');s.src=${JSON.stringify(`${config.publicBaseUrl}/tracker.js`)};s.defer=true;s.dataset.pixeoToken=${JSON.stringify(deployment.public_token)};s.dataset.pixeoDeployment=${JSON.stringify(deployment.id)};document.head.appendChild(s);}());`;
+    return reply
+      .type('application/javascript; charset=utf-8')
+      .header('Cache-Control', 'no-store')
+      .send(script);
+  });
+
   app.get('/tracker.js', async (request, reply) => {
     if (request.headers['if-none-match'] === trackerEtag) return reply.code(304).send();
     return reply
@@ -283,8 +325,8 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
         await client.query(
           `INSERT INTO insights_deployments (
              id, owner_id, landing_id, landing_name, store_id,
-             shop_domain, product_id, token_hash
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+             shop_domain, product_id, token_hash, public_token
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [
             deploymentId,
             ownerId(request),
@@ -294,6 +336,7 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
             shopDomain,
             body.data.productId,
             tokenHash,
+            token,
           ],
         );
       });

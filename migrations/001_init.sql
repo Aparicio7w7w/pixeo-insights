@@ -5,8 +5,9 @@ CREATE TABLE IF NOT EXISTS insights_deployments (
   landing_name varchar(200) NOT NULL,
   store_id varchar(128),
   shop_domain varchar(253) NOT NULL,
-  product_id varchar(128) NOT NULL,
+  product_id varchar(255) NOT NULL,
   token_hash char(64) NOT NULL UNIQUE,
+  public_token varchar(43),
   active boolean NOT NULL DEFAULT true,
   published boolean NOT NULL DEFAULT false,
   product_handle varchar(255),
@@ -16,6 +17,8 @@ CREATE TABLE IF NOT EXISTS insights_deployments (
   deactivated_at timestamptz
 );
 
+ALTER TABLE insights_deployments ALTER COLUMN product_id TYPE varchar(255);
+ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS public_token varchar(43);
 ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS published boolean NOT NULL DEFAULT false;
 ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS product_handle varchar(255);
 ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS published_url varchar(2048);
