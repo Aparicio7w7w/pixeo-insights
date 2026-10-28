@@ -1,7 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg';
+import pg from 'pg';
+import type { Pool as PgPool, PoolClient, QueryResult, QueryResultRow } from 'pg';
+
+const { Pool } = pg;
 
 export interface Queryable {
   query<Row extends QueryResultRow = QueryResultRow>(
@@ -11,7 +14,7 @@ export interface Queryable {
 }
 
 export class Database implements Queryable {
-  private readonly pool: Pool;
+  private readonly pool: PgPool;
 
   public constructor(connectionString: string) {
     this.pool = new Pool({
