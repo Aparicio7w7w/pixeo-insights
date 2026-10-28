@@ -254,6 +254,20 @@ async function boot(): Promise<void> {
       block.setAttribute('data-pixeo-item-id', `bloque-${String(blockIndex)}`);
     }
   }
+  // Si solo hay un bloque (Shopify aplanó el HTML), cada imagen grande es una sección.
+  if (blockIndex < 2) {
+    let imgIndex = 0;
+    for (const img of document.querySelectorAll('.product-landing-content img')) {
+      if (img.getAttribute('alt') === 'CTA' || img.classList.contains('connector-image')) continue;
+      imgIndex += 1;
+      img.setAttribute('data-pixeo-item-id', `bloque-${String(imgIndex)}`);
+    }
+    if (imgIndex >= 2) {
+      for (const el of document.querySelectorAll('.product-landing-content [data-pixeo-item-id]:not(img)')) {
+        el.removeAttribute('data-pixeo-item-id');
+      }
+    }
+  }
   for (const section of document.querySelectorAll('[id^="pix-section-"],[data-pixeo-item-id]')) {
     sections.set(section, { visibleSince: null, totalMs: 0, viewed: false });
     sectionObserver.observe(section);
