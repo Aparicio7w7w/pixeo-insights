@@ -46,7 +46,31 @@ export class SupabaseAuth {
       }
 
       request.auth = { ownerId: payload.sub };
+      return;
     } catch {
+      const apiKey = request.headers.apikey;
+      if (typeof apiKey === 'string' && apiKey.length > 0) {
+        try {
+          const response = await fetch(`${this.config.supabaseUrl}/auth/v1/user`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              apikey: apiKey,
+            },
+          });
+          if (response.ok) {
+            const user: unknown = await response.json();
+            if (user && typeof user === 'object' && 'id' in user) {
+              const id = user.id;
+              if (typeof id === 'string' && id.length > 0 && id.length <= 255) {
+                request.auth = { ownerId: id };
+                return;
+              }
+            }
+          }
+        } catch {
+          // La respuesta 401 común se maneja abajo.
+        }
+      }
       await reply.code(401).send({ error: 'unauthorized' });
     }
   }

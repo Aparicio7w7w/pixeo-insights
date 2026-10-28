@@ -142,7 +142,7 @@ function encodeCursor(row: SessionRow): string {
 function setCors(reply: FastifyReply, origin: string): void {
   void reply.header('Access-Control-Allow-Origin', origin);
   void reply.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  void reply.header('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  void reply.header('Access-Control-Allow-Headers', 'Authorization,Content-Type,apikey');
   void reply.header('Access-Control-Max-Age', '600');
   void reply.header('Vary', 'Origin');
 }
