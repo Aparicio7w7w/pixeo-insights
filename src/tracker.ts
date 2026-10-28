@@ -34,6 +34,9 @@ interface SectionState {
 const CTA_SELECTORS = [
   '[data-pixeo-cta]',
   '.pixeo-cta',
+  '#trigger-buy',
+  '[data-pixeo-releasit-trigger]',
+  '.pixeo-releasit-trigger',
   '[class*="releasit"] button',
   '[id*="releasit"] button',
   '[class*="easysell"] button',
@@ -236,7 +239,7 @@ async function boot(): Promise<void> {
     },
     { threshold: [0.25] },
   );
-  for (const section of document.querySelectorAll('[id^="pix-section-"]')) {
+  for (const section of document.querySelectorAll('[id^="pix-section-"],.image-container[data-pixeo-item-id]')) {
     sections.set(section, { visibleSince: null, totalMs: 0, viewed: false });
     sectionObserver.observe(section);
   }
