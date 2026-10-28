@@ -1,0 +1,97 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '5'
+
+services:
+  postgres:
+    image: postgres:16.8-alpine3.21
+    container_name: pixeo-insights-postgres
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 0.50
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - max_connections=50
+      - -c
+      - work_mem=4MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - pixeo_insights_private
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  api:
+    image: ${PIXEO_INSIGHTS_IMAGE:-pixeo-insights:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pixeo-insights-api
+    restart: unless-stopped
+    mem_limit: 640m
+    cpus: 0.50
+    env_file:
+      - .env
+    volumes:
+      - replay_data:/data/replays
+    networks:
+      - pixeo_insights_private
+      - traefik_public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - 'traefik.enable=true'
+      - 'traefik.docker.network=${TRAEFIK_NETWORK:-n8n_default}'
+      - 'traefik.http.routers.pixeo-insights.rule=Host(`${TRAEFIK_HOST}`)'
+      - 'traefik.http.routers.pixeo-insights.entrypoints=websecure'
+      - 'traefik.http.routers.pixeo-insights.tls=true'
+      - 'traefik.http.routers.pixeo-insights.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-mytlschallenge}'
+      - 'traefik.http.services.pixeo-insights.loadbalancer.server.port=3000'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  replay_data:
+
+networks:
+  pixeo_insights_private:
+    internal: true
+  traefik_public:
+    external: true
+    name: ${TRAEFIK_NETWORK:-n8n_default}
