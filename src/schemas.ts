@@ -137,6 +137,13 @@ export const sessionsQuerySchema = z
   .strict();
 
 export const landingParamsSchema = z.object({ landingId: safeIdSchema }).strict();
+export const deploymentParamsSchema = z.object({ deploymentId: z.uuid() }).strict();
+export const confirmDeploymentBodySchema = z
+  .object({
+    productHandle: z.string().trim().min(1).max(255),
+    publishedUrl: z.url().max(2048),
+  })
+  .strict();
 export const landingSessionParamsSchema = z
   .object({ landingId: safeIdSchema, sessionId: z.uuid() })
   .strict();

@@ -12,7 +12,9 @@ import { FixedWindowRateLimiter } from './rateLimiter.js';
 import type { ReplayStore } from './replayStore.js';
 import {
   collectorBatchSchema,
+  confirmDeploymentBodySchema,
   deploymentBodySchema,
+  deploymentParamsSchema,
   landingParamsSchema,
   landingSessionParamsSchema,
   rangeSchema,
@@ -30,6 +32,15 @@ interface RouteDependencies {
   database: Database;
   replayStore: ReplayStore;
   trackerBundle: Buffer;
+}
+
+interface PublicationRow extends QueryResultRow {
+  id: string;
+  shop_domain: string;
+  product_id: string;
+  product_handle: string;
+  published_url: string;
+  published_at: Date;
 }
 
 interface SummaryRow extends QueryResultRow {
@@ -292,6 +303,70 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
         token,
         trackerUrl: `${config.publicBaseUrl}/tracker.js`,
       });
+    },
+  );
+
+  app.post(
+    `${API_PREFIX}/deployments/:deploymentId/confirm`,
+    { preHandler: auth.authenticate.bind(auth) },
+    async (request, reply) => {
+      const params = deploymentParamsSchema.safeParse(request.params);
+      const body = confirmDeploymentBodySchema.safeParse(request.body);
+      if (!params.success || !body.success) {
+        await reply.code(400).send({ error: 'invalid_request' });
+        return;
+      }
+
+      const result = await database.query<PublicationRow>(
+        `UPDATE insights_deployments
+         SET published = true, product_handle = $3, published_url = $4, published_at = now()
+         WHERE id = $1 AND owner_id = $2
+         RETURNING id, shop_domain, product_id, product_handle, published_url, published_at`,
+        [params.data.deploymentId, ownerId(request), body.data.productHandle, body.data.publishedUrl],
+      );
+      const publication = result.rows[0];
+      if (!publication) {
+        await reply.code(404).send({ error: 'not_found' });
+        return;
+      }
+      await reply.send({
+        deploymentId: publication.id,
+        shopDomain: publication.shop_domain,
+        productId: publication.product_id,
+        productHandle: publication.product_handle,
+        publishedUrl: publication.published_url,
+        publishedAt: publication.published_at,
+      });
+    },
+  );
+
+  app.get(
+    `${API_PREFIX}/landings/:landingId/publication`,
+    { preHandler: auth.authenticate.bind(auth) },
+    async (request, reply) => {
+      const params = landingParamsSchema.safeParse(request.params);
+      if (!params.success) {
+        await reply.code(400).send({ error: 'invalid_request' });
+        return;
+      }
+      const result = await database.query<PublicationRow>(
+        `SELECT id, shop_domain, product_id, product_handle, published_url, published_at
+         FROM insights_deployments
+         WHERE owner_id = $1 AND landing_id = $2 AND published = true
+         ORDER BY published_at DESC
+         LIMIT 1`,
+        [ownerId(request), params.data.landingId],
+      );
+      const publication = result.rows[0];
+      await reply.send(publication ? {
+        published: true,
+        deploymentId: publication.id,
+        shopDomain: publication.shop_domain,
+        productId: publication.product_id,
+        productHandle: publication.product_handle,
+        publishedUrl: publication.published_url,
+        publishedAt: publication.published_at,
+      } : { published: false });
     },
   );
 

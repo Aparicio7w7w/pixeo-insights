@@ -8,9 +8,18 @@ CREATE TABLE IF NOT EXISTS insights_deployments (
   product_id varchar(128) NOT NULL,
   token_hash char(64) NOT NULL UNIQUE,
   active boolean NOT NULL DEFAULT true,
+  published boolean NOT NULL DEFAULT false,
+  product_handle varchar(255),
+  published_url varchar(2048),
   created_at timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz,
   deactivated_at timestamptz
 );
+
+ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS published boolean NOT NULL DEFAULT false;
+ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS product_handle varchar(255);
+ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS published_url varchar(2048);
+ALTER TABLE insights_deployments ADD COLUMN IF NOT EXISTS published_at timestamptz;
 
 CREATE INDEX IF NOT EXISTS insights_deployments_owner_landing
   ON insights_deployments (owner_id, landing_id, created_at DESC);
