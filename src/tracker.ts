@@ -101,6 +101,26 @@ function isInteractive(target: Element): boolean {
   );
 }
 
+function sectionIdOf(target: Element): string | null {
+  const section = target.closest('[data-pixeo-item-id],[id^="pix-section-"]');
+  if (!section) return null;
+  const id = section.getAttribute('data-pixeo-item-id') ?? section.id.replace(/^pix-section-/, '');
+  return id ? id.slice(0, 200) : null;
+}
+
+function describeTarget(target: Element): string {
+  const tag = target.tagName.toLowerCase();
+  if (target instanceof HTMLImageElement) {
+    return `img${target.alt ? `: ${target.alt.trim().slice(0, 60)}` : ''}`;
+  }
+  const label = (target.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  return label ? `${tag}: ${label}` : tag;
+}
+
+function clickContext(target: Element): Record<string, string | null> {
+  return { sectionId: sectionIdOf(target), target: describeTarget(target) };
+}
+
 async function boot(): Promise<void> {
   const script = currentScript();
   const token = script?.dataset.pixeoToken;
@@ -120,13 +140,15 @@ async function boot(): Promise<void> {
 
   const post = async (payload: Readonly<Record<string, unknown>>): Promise<ReplayDecision | null> => {
     try {
+      const body = JSON.stringify(payload);
       const response = await fetch(endpoint, {
         method: 'POST',
         mode: 'cors',
         credentials: 'omit',
-        keepalive: true,
+        // keepalive falla con cuerpos > 64KB (p. ej. el FullSnapshot).
+        keepalive: body.length < 60_000,
         headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-        body: JSON.stringify(payload),
+        body,
       });
       if (!response.ok) return null;
       const value: unknown = await response.json();
@@ -289,12 +311,14 @@ async function boot(): Promise<void> {
       const nearby = recentClicks.filter(
         (click) => Math.hypot(click.x - event.clientX, click.y - event.clientY) <= 30,
       );
-      if (nearby.length === 3) emit('rage_click');
+      if (nearby.length === 3) emit('rage_click', clickContext(target));
 
       if (!cta && !isInteractive(target)) {
         const versionAtClick = mutationVersion;
         window.setTimeout(() => {
-          if (mutationVersion === versionAtClick && document.contains(target)) emit('dead_click');
+          if (mutationVersion === versionAtClick && document.contains(target)) {
+            emit('dead_click', clickContext(target));
+          }
         }, 800);
       }
     },
@@ -320,12 +344,15 @@ async function boot(): Promise<void> {
   );
 
   if (startResponse.replay?.enabled) {
-    const maxBytes = Math.min(512_000, startResponse.replay.maxBytes);
+    const maxBytes = Math.min(3_145_728, startResponse.replay.maxBytes);
     const maxDurationMs = Math.min(180_000, startResponse.replay.maxDurationMs);
     stopReplay = record({
       emit(event) {
         const eventBytes = new TextEncoder().encode(JSON.stringify(event)).byteLength;
-        if (replayTotalBytes + eventBytes > maxBytes) {
+        // Meta (4) y FullSnapshot (2) se guardan siempre: sin ellos el replay queda en blanco.
+        const eventType: number = event.type;
+        const isSnapshot = eventType === 2 || eventType === 4;
+        if (!isSnapshot && replayTotalBytes + eventBytes > maxBytes) {
           flushReplay();
           stopReplay?.();
           stopReplay = undefined;
@@ -334,8 +361,11 @@ async function boot(): Promise<void> {
         replayBuffer.push(event);
         replayBufferBytes += eventBytes;
         replayTotalBytes += eventBytes;
-        if (replayBufferBytes >= 50_000) flushReplay();
+        if (eventType === 2 || replayBufferBytes >= 50_000 || replayBuffer.length >= 400) {
+          flushReplay();
+        }
       },
+      inlineStylesheet: true,
       maskAllInputs: true,
       blockSelector:
         '.pixeo-insights-block,iframe,[data-sensitive],[data-private],input[type="password"],input[autocomplete^="cc-"]',

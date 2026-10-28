@@ -102,6 +102,59 @@ const cursorSchema = z
   })
   .strict();
 
+interface FunnelRow extends QueryResultRow {
+  section_id: string;
+  reached: string;
+  dropoff: string;
+  avg_visible_ms: string | null;
+  dead_clicks: string;
+  rage_clicks: string;
+}
+
+interface DeadTargetRow extends QueryResultRow {
+  section_id: string;
+  target: string;
+  count: string;
+}
+
+interface VisitsRow extends QueryResultRow {
+  visits: string;
+  cta_sessions: string;
+}
+
+function replayMeta(event: unknown): { type: number; timestamp: number } {
+  if (event && typeof event === 'object') {
+    const { type, timestamp } = event as { type?: unknown; timestamp?: unknown };
+    return {
+      type: typeof type === 'number' ? type : -1,
+      timestamp: typeof timestamp === 'number' ? timestamp : 0,
+    };
+  }
+  return { type: -1, timestamp: 0 };
+}
+
+/** Ordena por timestamp (Meta antes que FullSnapshot en empate) y deja el primer snapshot al inicio. */
+function sortReplayEvents(events: unknown[]): void {
+  const rank = (type: number): number => (type === 4 ? 0 : type === 2 ? 1 : 2);
+  events.sort((a, b) => {
+    const left = replayMeta(a);
+    const right = replayMeta(b);
+    return left.timestamp - right.timestamp || rank(left.type) - rank(right.type);
+  });
+  const fullIndex = events.findIndex((event) => replayMeta(event).type === 2);
+  if (fullIndex <= 0) return;
+  let metaIndex = -1;
+  for (let index = fullIndex - 1; index >= 0; index -= 1) {
+    if (replayMeta(events[index]).type === 4) {
+      metaIndex = index;
+      break;
+    }
+  }
+  const full = events.splice(fullIndex, 1);
+  const meta = metaIndex >= 0 ? events.splice(metaIndex, 1) : [];
+  events.unshift(...meta, ...full);
+}
+
 function ownerId(request: FastifyRequest): string {
   if (!request.auth) throw new Error('Contexto de autenticación ausente');
   return request.auth.ownerId;
@@ -426,6 +479,105 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
       const interval = { '24h': '24 hours', '7d': '7 days', '30d': '30 days' }[
         queryObject.data.range
       ];
+      const funnelArgs = [ownerId(request), params.data.landingId, interval];
+      const [visitsResult, funnelResult, deadTargetsResult] = await Promise.all([
+        database.query<VisitsRow>(
+          `SELECT
+             COUNT(DISTINCT (deployment_id, session_id))
+               FILTER (WHERE event_type = 'page_view')::text AS visits,
+             COUNT(DISTINCT (deployment_id, session_id))
+               FILTER (WHERE event_type = 'cta_click')::text AS cta_sessions
+           FROM insights_analytics_events
+           WHERE owner_id = $1 AND landing_id = $2
+             AND occurred_at >= now() - $3::interval
+             AND event_type IN ('page_view', 'cta_click')`,
+          funnelArgs,
+        ),
+        database.query<FunnelRow>(
+          `WITH ev AS (
+             SELECT deployment_id, session_id, event_type, occurred_at,
+                    payload, payload->>'sectionId' AS sid
+             FROM insights_analytics_events
+             WHERE owner_id = $1 AND landing_id = $2
+               AND occurred_at >= now() - $3::interval
+               AND event_type IN ('section_view', 'visible_ms', 'dead_click', 'rage_click')
+               AND COALESCE(payload->>'sectionId', '') <> ''
+           ), views AS (
+             SELECT deployment_id, session_id, sid, MIN(occurred_at) AS at
+             FROM ev WHERE event_type = 'section_view'
+             GROUP BY deployment_id, session_id, sid
+           ), starts AS (
+             SELECT deployment_id, session_id, MIN(at) AS start_at
+             FROM views GROUP BY deployment_id, session_id
+           ), reach AS (
+             SELECT v.sid, COUNT(*) AS reached,
+                    AVG(EXTRACT(EPOCH FROM (v.at - s.start_at))) AS avg_offset,
+                    MIN(v.at) AS first_at
+             FROM views v JOIN starts s USING (deployment_id, session_id)
+             GROUP BY v.sid
+           ), last_views AS (
+             SELECT DISTINCT ON (deployment_id, session_id) sid
+             FROM views ORDER BY deployment_id, session_id, at DESC
+           ), drops AS (
+             SELECT sid, COUNT(*) AS dropoff FROM last_views GROUP BY sid
+           ), stats AS (
+             SELECT sid,
+                    AVG(CASE WHEN event_type = 'visible_ms'
+                             AND payload->>'milliseconds' ~ '^[0-9]+$'
+                             THEN (payload->>'milliseconds')::numeric END) AS avg_visible_ms,
+                    COUNT(*) FILTER (WHERE event_type = 'dead_click') AS dead_clicks,
+                    COUNT(*) FILTER (WHERE event_type = 'rage_click') AS rage_clicks
+             FROM ev GROUP BY sid
+           )
+           SELECT r.sid AS section_id, r.reached::text,
+                  COALESCE(d.dropoff, 0)::text AS dropoff,
+                  st.avg_visible_ms::text,
+                  COALESCE(st.dead_clicks, 0)::text AS dead_clicks,
+                  COALESCE(st.rage_clicks, 0)::text AS rage_clicks
+           FROM reach r
+           LEFT JOIN drops d ON d.sid = r.sid
+           LEFT JOIN stats st ON st.sid = r.sid
+           ORDER BY r.avg_offset, r.first_at`,
+          funnelArgs,
+        ),
+        database.query<DeadTargetRow>(
+          `SELECT payload->>'sectionId' AS section_id, payload->>'target' AS target,
+                  COUNT(*)::text AS count
+           FROM insights_analytics_events
+           WHERE owner_id = $1 AND landing_id = $2
+             AND occurred_at >= now() - $3::interval
+             AND event_type = 'dead_click'
+             AND COALESCE(payload->>'sectionId', '') <> ''
+             AND COALESCE(payload->>'target', '') <> ''
+           GROUP BY 1, 2
+           ORDER BY COUNT(*) DESC`,
+          funnelArgs,
+        ),
+      ]);
+      const visits = Number(visitsResult.rows[0]?.visits ?? 0);
+      const ctaSessions = Number(visitsResult.rows[0]?.cta_sessions ?? 0);
+      const pct = (value: number): number => (visits > 0 ? (value / visits) * 100 : 0);
+      const deadTargets = new Map<string, { target: string; count: number }[]>();
+      for (const deadRow of deadTargetsResult.rows) {
+        const list = deadTargets.get(deadRow.section_id) ?? [];
+        if (list.length < 5) list.push({ target: deadRow.target, count: Number(deadRow.count) });
+        deadTargets.set(deadRow.section_id, list);
+      }
+      const funnel = funnelResult.rows.map((funnelRow, index) => {
+        const reached = Number(funnelRow.reached);
+        return {
+          sectionId: funnelRow.section_id,
+          order: index + 1,
+          reached,
+          reachedPct: pct(reached),
+          dropoffPct: pct(Number(funnelRow.dropoff)),
+          avgVisibleMs: funnelRow.avg_visible_ms === null ? null : Number(funnelRow.avg_visible_ms),
+          deadClicks: Number(funnelRow.dead_clicks),
+          rageClicks: Number(funnelRow.rage_clicks),
+          topDeadTargets: deadTargets.get(funnelRow.section_id) ?? [],
+        };
+      });
+
       const [summaryResult, sectionsResult] = await Promise.all([
         database.query<SummaryRow>(
           `WITH selected_sessions AS (
@@ -492,6 +644,9 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
         deadClicks: Number(row?.dead_clicks ?? 0),
         averageDurationMs: Number(row?.average_duration_ms ?? 0),
         averageMaxScroll: Number(row?.average_max_scroll ?? 0),
+        visits,
+        ctaPct: pct(ctaSessions),
+        funnel,
         sections: sectionsResult.rows.map((section) => {
           const reachedVisitors = Number(section.reached_sessions);
           return {
@@ -638,6 +793,7 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
       for (const file of replayFiles.rows) {
         replayEvents.push(...(await replayStore.read(file.file_name)));
       }
+      sortReplayEvents(replayEvents);
       await reply.send({
         sessionId: selected.session_id,
         analytics: analytics.rows.map((event) => ({

@@ -196,7 +196,12 @@ export class CollectorService {
         if (Date.now() - current.started_at.getTime() > 180_000) {
           return { accepted: false, reason: 'session_limit' };
         }
-        if (current.replay_raw_bytes + rawBytes > this.config.replayMaxSessionBytes) {
+        // El snapshot inicial (Meta 4 + FullSnapshot 2) se acepta siempre: sin él el replay sale en blanco.
+        const hasFullSnapshot = batch.events.some((event) => event.type === 2);
+        if (
+          !hasFullSnapshot &&
+          current.replay_raw_bytes + rawBytes > this.config.replayMaxSessionBytes
+        ) {
           return { accepted: false, reason: 'session_limit' };
         }
 

@@ -19,14 +19,14 @@ const envSchema = z.object({
   TRUST_PROXY: booleanFromString,
   REPLAY_DIR: z.string().min(1).default('/data/replays'),
   REPLAY_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0.05),
-  REPLAY_MAX_SESSION_BYTES: z.coerce.number().int().min(1).default(512_000),
+  REPLAY_MAX_SESSION_BYTES: z.coerce.number().int().min(1).default(3_145_728),
   REPLAY_MIN_FREE_DISK_BYTES: z.coerce.number().int().min(0).default(16_106_127_360),
   REPLAY_MIN_FREE_MEMORY_RATIO: z.coerce.number().min(0).max(1).default(0.15),
   REPLAY_QUOTA_BYTES: z.coerce.number().int().min(1).default(10_737_418_240),
   RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(7),
   CLEANUP_INTERVAL_MINUTES: z.coerce.number().int().min(1).default(60),
   COLLECT_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(1).default(120),
-  COLLECT_BODY_LIMIT_BYTES: z.coerce.number().int().min(1024).default(655_360),
+  COLLECT_BODY_LIMIT_BYTES: z.coerce.number().int().min(1024).default(6_553_600),
 });
 
 export interface AppConfig {
@@ -60,6 +60,8 @@ function normalizeOrigin(value: string): string {
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
   const env = envSchema.parse(environment);
+  // Mínimo 3MB por sesión: los FullSnapshot de Shopify superan 500KB.
+  const replayMaxSessionBytes = Math.max(env.REPLAY_MAX_SESSION_BYTES, 3_145_728);
   const supabaseUrl = env.SUPABASE_URL.replace(/\/$/, '');
   const dashboardOrigins = new Set(
     env.DASHBOARD_ORIGINS.split(',').map(normalizeOrigin),
@@ -79,13 +81,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     trustProxy: env.TRUST_PROXY,
     replayDir: env.REPLAY_DIR,
     replaySampleRate: env.REPLAY_SAMPLE_RATE,
-    replayMaxSessionBytes: env.REPLAY_MAX_SESSION_BYTES,
+    replayMaxSessionBytes,
     replayMinFreeDiskBytes: env.REPLAY_MIN_FREE_DISK_BYTES,
     replayMinFreeMemoryRatio: env.REPLAY_MIN_FREE_MEMORY_RATIO,
     replayQuotaBytes: env.REPLAY_QUOTA_BYTES,
     retentionDays: env.RETENTION_DAYS,
     cleanupIntervalMinutes: env.CLEANUP_INTERVAL_MINUTES,
     collectRateLimitPerMinute: env.COLLECT_RATE_LIMIT_PER_MINUTE,
-    collectBodyLimitBytes: env.COLLECT_BODY_LIMIT_BYTES,
+    collectBodyLimitBytes: Math.max(env.COLLECT_BODY_LIMIT_BYTES, replayMaxSessionBytes * 2 + 262_144),
   };
 }
