@@ -251,7 +251,7 @@ async function boot(): Promise<void> {
   )) {
     blockIndex += 1;
     if (!block.getAttribute('data-pixeo-item-id') && !block.id.startsWith('pix-section-')) {
-      block.setAttribute('data-pixeo-item-id', `bloque-${blockIndex}`);
+      block.setAttribute('data-pixeo-item-id', `bloque-${String(blockIndex)}`);
     }
   }
   for (const section of document.querySelectorAll('[id^="pix-section-"],[data-pixeo-item-id]')) {
