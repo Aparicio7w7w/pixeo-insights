@@ -12,7 +12,7 @@ export const deploymentBodySchema = z
     landingName: z.string().trim().min(1).max(200),
     storeId: safeIdSchema.optional(),
     shopDomain: z.string().trim().min(1).max(253),
-    productId: z.string().trim().min(1).max(255),
+    productId: z.coerce.string().trim().min(1).max(255),
   })
   .strict();
 
