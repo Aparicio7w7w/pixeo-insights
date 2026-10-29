@@ -60,7 +60,10 @@ function safePagePath(): string {
 
 function referrerHost(): string {
   try {
-    return document.referrer ? new URL(document.referrer).hostname.slice(0, 253) : '';
+    if (!document.referrer) return '';
+    const host = new URL(document.referrer).hostname;
+    // Navegación dentro de la misma tienda: no es una fuente de tráfico.
+    return host === location.hostname ? 'tienda' : host.slice(0, 253);
   } catch {
     return '';
   }
@@ -328,14 +331,35 @@ async function boot(): Promise<void> {
     subtree: true,
     attributes: true,
   });
+  // El snippet COD del tema hace preventDefault en touchend: en móvil el "click"
+  // nunca llega, así que el botón Comprar se detecta en pointerup (y click como respaldo).
+  let lastCtaAt = 0;
+  const trackCta = (target: Element): string | null => {
+    const cta = matchedCta(target);
+    if (!cta) return null;
+    const now = Date.now();
+    if (now - lastCtaAt > 1000) {
+      lastCtaAt = now;
+      emit('cta_click', { selector: cta, sectionId: sectionIdOf(target) });
+      flushAnalytics();
+    }
+    return cta;
+  };
+  document.addEventListener(
+    'pointerup',
+    (event) => {
+      if (event.target instanceof Element) trackCta(event.target);
+    },
+    { capture: true, passive: true },
+  );
+
   const recentClicks: { at: number; x: number; y: number }[] = [];
   document.addEventListener(
     'click',
     (event) => {
       if (!(event.target instanceof Element)) return;
       const target = event.target;
-      const cta = matchedCta(target);
-      if (cta) emit('cta_click', { selector: cta });
+      const cta = trackCta(target);
 
       const now = Date.now();
       recentClicks.push({ at: now, x: event.clientX, y: event.clientY });

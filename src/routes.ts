@@ -30,7 +30,19 @@ const API_PREFIX = '/api/v1/insights';
  * Fragmentos SQL estáticos: los valores del usuario viajan siempre como $4 (source),
  * $5 (campaign) y $6 (device); NULL en un parámetro desactiva ese filtro.
  */
-const SOURCE_SQL = `COALESCE(NULLIF(s.context->'utm'->>'source', ''), NULLIF(s.context->>'referrerHost', ''), 'directo')`;
+// Fuente agrupada por red: l.facebook.com, m.facebook.com y utm_source=fb cuentan como "facebook".
+const RAW_SOURCE_SQL = `lower(COALESCE(NULLIF(s.context->'utm'->>'source', ''), NULLIF(s.context->>'referrerHost', ''), ''))`;
+const SOURCE_SQL = `(CASE
+  WHEN ${RAW_SOURCE_SQL} = '' THEN 'directo'
+  WHEN ${RAW_SOURCE_SQL} ~ '(instagram|^ig$)' THEN 'instagram'
+  WHEN ${RAW_SOURCE_SQL} ~ '(facebook|^fb$|fb\\.|^meta$)' THEN 'facebook'
+  WHEN ${RAW_SOURCE_SQL} ~ 'tiktok' THEN 'tiktok'
+  WHEN ${RAW_SOURCE_SQL} ~ '(youtube|youtu\\.be)' THEN 'youtube'
+  WHEN ${RAW_SOURCE_SQL} ~ 'google' THEN 'google'
+  WHEN ${RAW_SOURCE_SQL} ~ '(whatsapp|wa\\.me)' THEN 'whatsapp'
+  WHEN ${RAW_SOURCE_SQL} ~ '(^tienda$|myshopify\\.com$)' THEN 'tienda'
+  ELSE ${RAW_SOURCE_SQL}
+END)`;
 const CAMPAIGN_SQL = `COALESCE(NULLIF(s.context->'utm'->>'campaign', ''), 'sin campaña')`;
 const DEVICE_SQL = `COALESCE(NULLIF(s.context->>'device', ''), 'unknown')`;
 const SESSION_FILTER_SQL = `($4::text IS NULL OR ${SOURCE_SQL} = $4::text)
@@ -158,6 +170,7 @@ interface KpiRow extends QueryResultRow {
   rage_sessions: string;
   dead_sessions: string;
   quick_exit_sessions: string;
+  bottom_sessions: string;
   avg_time_ms: string | null;
   avg_scroll_pct: string | null;
 }
@@ -292,7 +305,10 @@ async function deploymentForCollector(
 export function registerRoutes(app: FastifyInstance, dependencies: RouteDependencies): void {
   const { auth, collector, config, database, replayStore, trackerBundle } = dependencies;
   const limiter = new FixedWindowRateLimiter(config.collectRateLimitPerMinute);
-  const trackerEtag = `"${sha256(trackerBundle.toString('binary'))}"`;
+  const trackerHash = sha256(trackerBundle.toString('binary'));
+  const trackerEtag = `"${trackerHash}"`;
+  // La versión en la URL evita que los navegadores sigan usando un tracker viejo en caché.
+  const trackerUrl = `${config.publicBaseUrl}/tracker.js?v=${trackerHash.slice(0, 12)}`;
 
   app.get('/health', () => ({ status: 'ok' }));
   app.get('/ready', async (_request, reply) => {
@@ -332,7 +348,7 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
       return reply.type('application/javascript').header('Cache-Control', 'no-store').send('');
     }
 
-    const script = `(function(){var s=document.createElement('script');s.src=${JSON.stringify(`${config.publicBaseUrl}/tracker.js`)};s.defer=true;s.dataset.pixeoToken=${JSON.stringify(deployment.public_token)};s.dataset.pixeoDeployment=${JSON.stringify(deployment.id)};document.head.appendChild(s);}());`;
+    const script = `(function(){var s=document.createElement('script');s.src=${JSON.stringify(trackerUrl)};s.defer=true;s.dataset.pixeoToken=${JSON.stringify(deployment.public_token)};s.dataset.pixeoDeployment=${JSON.stringify(deployment.id)};document.head.appendChild(s);}());`;
     return reply
       .type('application/javascript; charset=utf-8')
       .header('Cache-Control', 'no-store')
@@ -343,7 +359,7 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
     if (request.headers['if-none-match'] === trackerEtag) return reply.code(304).send();
     return reply
       .type('application/javascript; charset=utf-8')
-      .header('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
+      .header('Cache-Control', 'public, max-age=300')
       .header('ETag', trackerEtag)
       .send(trackerBundle);
   });
@@ -657,6 +673,7 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
                   COUNT(*) FILTER (
                     WHERE duration_ms < 10000 AND COALESCE(max_scroll, 0) < 25
                   )::text AS quick_exit_sessions,
+                  COUNT(*) FILTER (WHERE max_scroll >= 90)::text AS bottom_sessions,
                   AVG(duration_ms)::text AS avg_time_ms,
                   AVG(max_scroll)::text AS avg_scroll_pct
            FROM visits
@@ -849,6 +866,9 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
         ctaSessions: kpiCta,
         ctaPct: percentOf(kpiCta, kpiVisits),
         ctaPctPrev: percentOf(Number(previous?.cta_sessions ?? 0), kpiVisitsPrev),
+        bottomSessions: Number(current?.bottom_sessions ?? 0),
+        bottomPct: percentOf(Number(current?.bottom_sessions ?? 0), kpiVisits),
+        bottomPctPrev: percentOf(Number(previous?.bottom_sessions ?? 0), kpiVisitsPrev),
         avgTimeMs: Math.round(Number(current?.avg_time_ms ?? 0)),
         avgTimeMsPrev: Math.round(Number(previous?.avg_time_ms ?? 0)),
         avgScrollPct: round1(Number(current?.avg_scroll_pct ?? 0)),
