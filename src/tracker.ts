@@ -263,7 +263,7 @@ async function boot(): Promise<void> {
     for (const img of document.querySelectorAll('.product-landing-content img')) {
       if (img.getAttribute('alt') === 'CTA' || img.classList.contains('connector-image')) continue;
       imgIndex += 1;
-      img.setAttribute('data-pixeo-item-id', `bloque-${String(imgIndex)}`);
+      img.setAttribute('data-pixeo-item-id', `imagen-${String(imgIndex)}`);
     }
     if (imgIndex >= 2) {
       for (const el of document.querySelectorAll('.product-landing-content [data-pixeo-item-id]:not(img)')) {
