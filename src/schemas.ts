@@ -129,6 +129,22 @@ export type ReplayBatch = z.infer<typeof replayBatchSchema>;
 
 export const rangeSchema = z.enum(['24h', '7d', '30d']);
 
+// Filtro opcional del summary: vacío equivale a "sin filtro".
+const summaryFilterSchema = z
+  .string()
+  .max(200)
+  .optional()
+  .transform((value) => (value === undefined || value === '' ? null : value));
+
+export const summaryQuerySchema = z
+  .object({
+    range: rangeSchema.default('7d'),
+    source: summaryFilterSchema,
+    campaign: summaryFilterSchema,
+    device: summaryFilterSchema,
+  })
+  .strict();
+
 export const sessionsQuerySchema = z
   .object({
     cursor: z.string().max(1000).optional(),

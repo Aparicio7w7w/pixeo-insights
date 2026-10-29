@@ -17,13 +17,42 @@ import {
   deploymentParamsSchema,
   landingParamsSchema,
   landingSessionParamsSchema,
-  rangeSchema,
   sessionsQuerySchema,
+  summaryQuerySchema,
   tokenParamsSchema,
 } from './schemas.js';
 import { isCompatibleOrigin, normalizeShopDomain, sha256 } from './security.js';
 
 const API_PREFIX = '/api/v1/insights';
+
+/*
+ * Dimensiones del summary calculadas sobre insights_sessions (alias `s`).
+ * Fragmentos SQL estáticos: los valores del usuario viajan siempre como $4 (source),
+ * $5 (campaign) y $6 (device); NULL en un parámetro desactiva ese filtro.
+ */
+const SOURCE_SQL = `COALESCE(NULLIF(s.context->'utm'->>'source', ''), NULLIF(s.context->>'referrerHost', ''), 'directo')`;
+const CAMPAIGN_SQL = `COALESCE(NULLIF(s.context->'utm'->>'campaign', ''), 'sin campaña')`;
+const DEVICE_SQL = `COALESCE(NULLIF(s.context->>'device', ''), 'unknown')`;
+const SESSION_FILTER_SQL = `($4::text IS NULL OR ${SOURCE_SQL} = $4::text)
+  AND ($5::text IS NULL OR ${CAMPAIGN_SQL} = $5::text)
+  AND ($6::text IS NULL OR ${DEVICE_SQL} = $6::text)`;
+/** Filtro para eventos (alias `e`): solo eventos de sesiones que cumplen los filtros. */
+const EVENT_FILTER_SQL = `(($4::text IS NULL AND $5::text IS NULL AND $6::text IS NULL)
+  OR EXISTS (
+    SELECT 1 FROM insights_sessions s
+    WHERE s.deployment_id = e.deployment_id AND s.session_id = e.session_id
+      AND s.owner_id = $1 AND ${SESSION_FILTER_SQL}
+  ))`;
+const MAX_SCROLL_SQL = `MAX(CASE WHEN e.event_type = 'max_scroll'
+                  AND e.payload->>'percent' ~ '^[0-9]+(\\.[0-9]+)?$'
+                  THEN LEAST((e.payload->>'percent')::numeric, 100) END)`;
+/** Duración por sesión en ms: (ended_at o último evento) - started_at, acotada a [0, 30 min]. */
+const DURATION_MS_SQL = `LEAST(GREATEST(
+    EXTRACT(EPOCH FROM (COALESCE(s.ended_at, p.last_event_at) - s.started_at)) * 1000, 0), 1800000)`;
+
+const round1 = (value: number): number => Math.round(value * 10) / 10;
+const percentOf = (part: number, total: number): number =>
+  total > 0 ? round1((part / total) * 100) : 0;
 
 interface RouteDependencies {
   auth: SupabaseAuth;
@@ -120,6 +149,37 @@ interface DeadTargetRow extends QueryResultRow {
 interface VisitsRow extends QueryResultRow {
   visits: string;
   cta_sessions: string;
+}
+
+interface KpiRow extends QueryResultRow {
+  is_current: boolean;
+  visits: string;
+  cta_sessions: string;
+  rage_sessions: string;
+  dead_sessions: string;
+  quick_exit_sessions: string;
+  avg_time_ms: string | null;
+  avg_scroll_pct: string | null;
+}
+
+interface SeriesRow extends QueryResultRow {
+  bucket: Date;
+  visits: string;
+  cta_sessions: string;
+}
+
+interface BreakdownRow extends QueryResultRow {
+  dimension: 'source' | 'campaign' | 'device';
+  dim_key: string;
+  visits: string;
+  cta_sessions: string;
+}
+
+interface BreakdownItem {
+  key: string;
+  visits: number;
+  ctaSessions: number;
+  ctaPct: number;
 }
 
 function replayMeta(event: unknown): { type: number; timestamp: number } {
@@ -471,37 +531,49 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
     { preHandler: auth.authenticate.bind(auth) },
     async (request, reply) => {
       const params = landingParamsSchema.safeParse(request.params);
-      const queryObject = z.object({ range: rangeSchema.default('7d') }).strict().safeParse(request.query);
+      const queryObject = summaryQuerySchema.safeParse(request.query);
       if (!params.success || !queryObject.success) {
         await reply.code(400).send({ error: 'invalid_request' });
         return;
       }
-      const interval = { '24h': '24 hours', '7d': '7 days', '30d': '30 days' }[
-        queryObject.data.range
-      ];
-      const funnelArgs = [ownerId(request), params.data.landingId, interval];
-      const [visitsResult, funnelResult, deadTargetsResult] = await Promise.all([
+      const { range, source, campaign, device } = queryObject.data;
+      const interval = { '24h': '24 hours', '7d': '7 days', '30d': '30 days' }[range];
+      const bucketUnit = range === '24h' ? 'hour' : 'day';
+      const bucketStep = range === '24h' ? '1 hour' : '1 day';
+      const baseArgs = [ownerId(request), params.data.landingId, interval];
+      // $1 owner, $2 landing, $3 interval, $4 source, $5 campaign, $6 device.
+      const funnelArgs = [...baseArgs, source, campaign, device];
+      const [
+        visitsResult,
+        funnelResult,
+        deadTargetsResult,
+        kpiResult,
+        seriesResult,
+        breakdownResult,
+      ] = await Promise.all([
         database.query<VisitsRow>(
           `SELECT
              COUNT(DISTINCT (deployment_id, session_id))
                FILTER (WHERE event_type = 'page_view')::text AS visits,
              COUNT(DISTINCT (deployment_id, session_id))
                FILTER (WHERE event_type = 'cta_click')::text AS cta_sessions
-           FROM insights_analytics_events
+           FROM insights_analytics_events e
            WHERE owner_id = $1 AND landing_id = $2
              AND occurred_at >= now() - $3::interval
-             AND event_type IN ('page_view', 'cta_click')`,
+             AND event_type IN ('page_view', 'cta_click')
+             AND ${EVENT_FILTER_SQL}`,
           funnelArgs,
         ),
         database.query<FunnelRow>(
           `WITH ev AS (
              SELECT deployment_id, session_id, event_type, occurred_at,
                     payload, payload->>'sectionId' AS sid
-             FROM insights_analytics_events
+             FROM insights_analytics_events e
              WHERE owner_id = $1 AND landing_id = $2
                AND occurred_at >= now() - $3::interval
                AND event_type IN ('section_view', 'visible_ms', 'dead_click', 'rage_click')
                AND COALESCE(payload->>'sectionId', '') <> ''
+               AND ${EVENT_FILTER_SQL}
            ), views AS (
              SELECT deployment_id, session_id, sid, MIN(occurred_at) AS at
              FROM ev WHERE event_type = 'section_view'
@@ -543,14 +615,140 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
         database.query<DeadTargetRow>(
           `SELECT payload->>'sectionId' AS section_id, payload->>'target' AS target,
                   COUNT(*)::text AS count
-           FROM insights_analytics_events
+           FROM insights_analytics_events e
            WHERE owner_id = $1 AND landing_id = $2
              AND occurred_at >= now() - $3::interval
              AND event_type = 'dead_click'
              AND COALESCE(payload->>'sectionId', '') <> ''
              AND COALESCE(payload->>'target', '') <> ''
+             AND ${EVENT_FILTER_SQL}
            GROUP BY 1, 2
            ORDER BY COUNT(*) DESC`,
+          funnelArgs,
+        ),
+        // KPIs del periodo actual y del anterior de igual duración (visita = sesión con page_view).
+        database.query<KpiRow>(
+          `WITH per_session AS (
+             SELECT e.deployment_id, e.session_id,
+                    e.occurred_at >= now() - $3::interval AS is_current,
+                    MAX(e.occurred_at) AS last_event_at,
+                    bool_or(e.event_type = 'cta_click') AS has_cta,
+                    bool_or(e.event_type = 'rage_click') AS has_rage,
+                    bool_or(e.event_type = 'dead_click') AS has_dead,
+                    ${MAX_SCROLL_SQL} AS max_scroll
+             FROM insights_analytics_events e
+             WHERE e.owner_id = $1 AND e.landing_id = $2
+               AND e.occurred_at >= now() - 2 * $3::interval
+             GROUP BY 1, 2, 3
+             HAVING bool_or(e.event_type = 'page_view')
+           ), visits AS (
+             SELECT p.is_current, p.has_cta, p.has_rage, p.has_dead, p.max_scroll,
+                    ${DURATION_MS_SQL} AS duration_ms
+             FROM per_session p
+             JOIN insights_sessions s
+               ON s.deployment_id = p.deployment_id AND s.session_id = p.session_id
+             WHERE s.owner_id = $1 AND ${SESSION_FILTER_SQL}
+           )
+           SELECT is_current,
+                  COUNT(*)::text AS visits,
+                  COUNT(*) FILTER (WHERE has_cta)::text AS cta_sessions,
+                  COUNT(*) FILTER (WHERE has_rage)::text AS rage_sessions,
+                  COUNT(*) FILTER (WHERE has_dead)::text AS dead_sessions,
+                  COUNT(*) FILTER (
+                    WHERE duration_ms < 10000 AND COALESCE(max_scroll, 0) < 25
+                  )::text AS quick_exit_sessions,
+                  AVG(duration_ms)::text AS avg_time_ms,
+                  AVG(max_scroll)::text AS avg_scroll_pct
+           FROM visits
+           GROUP BY is_current`,
+          funnelArgs,
+        ),
+        // Serie temporal en UTC con huecos a 0: $7 unidad (hour|day), $8 paso.
+        database.query<SeriesRow>(
+          `WITH per_session AS (
+             SELECT e.deployment_id, e.session_id,
+                    MIN(e.occurred_at) FILTER (WHERE e.event_type = 'page_view') AS first_view_at,
+                    bool_or(e.event_type = 'cta_click') AS has_cta
+             FROM insights_analytics_events e
+             WHERE e.owner_id = $1 AND e.landing_id = $2
+               AND e.occurred_at >= now() - $3::interval
+               AND e.event_type IN ('page_view', 'cta_click')
+             GROUP BY 1, 2
+             HAVING bool_or(e.event_type = 'page_view')
+           ), visits AS (
+             SELECT date_trunc($7::text, LEAST(p.first_view_at, now()), 'UTC') AS bucket, p.has_cta
+             FROM per_session p
+             JOIN insights_sessions s
+               ON s.deployment_id = p.deployment_id AND s.session_id = p.session_id
+             WHERE s.owner_id = $1 AND ${SESSION_FILTER_SQL}
+           ), buckets AS (
+             SELECT generate_series(
+                      date_trunc($7::text, now() - $3::interval, 'UTC'),
+                      date_trunc($7::text, now(), 'UTC'),
+                      $8::interval
+                    ) AS bucket
+           )
+           SELECT b.bucket,
+                  COUNT(v.bucket)::text AS visits,
+                  COUNT(v.bucket) FILTER (WHERE v.has_cta)::text AS cta_sessions
+           FROM buckets b
+           LEFT JOIN visits v ON v.bucket = b.bucket
+           GROUP BY b.bucket
+           ORDER BY b.bucket`,
+          [...funnelArgs, bucketUnit, bucketStep],
+        ),
+        // Desglose top 10: cada dimensión ignora su propio filtro y respeta los demás.
+        database.query<BreakdownRow>(
+          `WITH per_session AS (
+             SELECT e.deployment_id, e.session_id,
+                    bool_or(e.event_type = 'cta_click') AS has_cta
+             FROM insights_analytics_events e
+             WHERE e.owner_id = $1 AND e.landing_id = $2
+               AND e.occurred_at >= now() - $3::interval
+               AND e.event_type IN ('page_view', 'cta_click')
+             GROUP BY 1, 2
+             HAVING bool_or(e.event_type = 'page_view')
+           ), keyed AS (
+             SELECT p.has_cta,
+                    ${SOURCE_SQL} AS source_key,
+                    ${CAMPAIGN_SQL} AS campaign_key,
+                    ${DEVICE_SQL} AS device_key
+             FROM per_session p
+             JOIN insights_sessions s
+               ON s.deployment_id = p.deployment_id AND s.session_id = p.session_id
+             WHERE s.owner_id = $1
+           ), grouped AS (
+             SELECT 'source'::text AS dimension, source_key AS dim_key,
+                    COUNT(*) AS visits, COUNT(*) FILTER (WHERE has_cta) AS cta_sessions
+             FROM keyed
+             WHERE ($5::text IS NULL OR campaign_key = $5::text)
+               AND ($6::text IS NULL OR device_key = $6::text)
+             GROUP BY source_key
+             UNION ALL
+             SELECT 'campaign'::text, campaign_key,
+                    COUNT(*), COUNT(*) FILTER (WHERE has_cta)
+             FROM keyed
+             WHERE ($4::text IS NULL OR source_key = $4::text)
+               AND ($6::text IS NULL OR device_key = $6::text)
+             GROUP BY campaign_key
+             UNION ALL
+             SELECT 'device'::text, device_key,
+                    COUNT(*), COUNT(*) FILTER (WHERE has_cta)
+             FROM keyed
+             WHERE ($4::text IS NULL OR source_key = $4::text)
+               AND ($5::text IS NULL OR campaign_key = $5::text)
+             GROUP BY device_key
+           ), ranked AS (
+             SELECT dimension, dim_key, visits, cta_sessions,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY dimension ORDER BY visits DESC, dim_key
+                    ) AS row_pos
+             FROM grouped
+           )
+           SELECT dimension, dim_key, visits::text, cta_sessions::text
+           FROM ranked
+           WHERE row_pos <= 10
+           ORDER BY dimension, row_pos`,
           funnelArgs,
         ),
       ]);
@@ -582,14 +780,16 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
         database.query<SummaryRow>(
           `WITH selected_sessions AS (
              SELECT deployment_id, session_id, started_at, last_seen_at
-             FROM insights_sessions
+             FROM insights_sessions s
              WHERE owner_id = $1 AND landing_id = $2
                AND started_at >= now() - $3::interval
+               AND ${SESSION_FILTER_SQL}
            ), selected_events AS (
              SELECT event_type, payload, deployment_id, session_id
-             FROM insights_analytics_events
+             FROM insights_analytics_events e
              WHERE owner_id = $1 AND landing_id = $2
                AND occurred_at >= now() - $3::interval
+               AND ${EVENT_FILTER_SQL}
            )
            SELECT
              (SELECT COUNT(*) FROM selected_sessions)::text AS sessions,
@@ -604,16 +804,17 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
                       AND payload->>'percent' ~ '^[0-9]+(\\.[0-9]+)?$'
                       THEN (payload->>'percent')::numeric END)::text AS average_max_scroll
            FROM selected_events`,
-          [ownerId(request), params.data.landingId, interval],
+          funnelArgs,
         ),
         database.query<SectionSummaryRow>(
           `WITH section_events AS (
              SELECT deployment_id, session_id, event_type, occurred_at, payload
-             FROM insights_analytics_events
+             FROM insights_analytics_events e
              WHERE owner_id = $1 AND landing_id = $2
                AND occurred_at >= now() - $3::interval
                AND event_type IN ('section_view', 'visible_ms')
                AND COALESCE(payload->>'sectionId', '') <> ''
+               AND ${EVENT_FILTER_SQL}
            )
            SELECT
              payload->>'sectionId' AS section_id,
@@ -626,15 +827,62 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
            FROM section_events
            GROUP BY payload->>'sectionId'
            ORDER BY first_seen_at`,
-          [ownerId(request), params.data.landingId, interval],
+          funnelArgs,
         ),
       ]);
       const row = summaryResult.rows[0];
       const sessions = Number(row?.sessions ?? 0);
       const pageViews = Number(row?.page_views ?? 0);
       const formSubmits = Number(row?.form_submits ?? 0);
+
+      const current = kpiResult.rows.find((kpiRow) => kpiRow.is_current);
+      const previous = kpiResult.rows.find((kpiRow) => !kpiRow.is_current);
+      const kpiVisits = Number(current?.visits ?? 0);
+      const kpiVisitsPrev = Number(previous?.visits ?? 0);
+      const kpiCta = Number(current?.cta_sessions ?? 0);
+      const rageSessions = Number(current?.rage_sessions ?? 0);
+      const deadSessions = Number(current?.dead_sessions ?? 0);
+      const quickExitSessions = Number(current?.quick_exit_sessions ?? 0);
+      const kpis = {
+        visits: kpiVisits,
+        visitsPrev: kpiVisitsPrev,
+        ctaSessions: kpiCta,
+        ctaPct: percentOf(kpiCta, kpiVisits),
+        ctaPctPrev: percentOf(Number(previous?.cta_sessions ?? 0), kpiVisitsPrev),
+        avgTimeMs: Math.round(Number(current?.avg_time_ms ?? 0)),
+        avgTimeMsPrev: Math.round(Number(previous?.avg_time_ms ?? 0)),
+        avgScrollPct: round1(Number(current?.avg_scroll_pct ?? 0)),
+        avgScrollPctPrev: round1(Number(previous?.avg_scroll_pct ?? 0)),
+        rageSessions,
+        ragePct: percentOf(rageSessions, kpiVisits),
+        deadSessions,
+        deadPct: percentOf(deadSessions, kpiVisits),
+        quickExitSessions,
+        quickExitPct: percentOf(quickExitSessions, kpiVisits),
+      };
+      const series = seriesResult.rows.map((seriesRow) => ({
+        bucket: seriesRow.bucket.toISOString(),
+        visits: Number(seriesRow.visits),
+        ctaSessions: Number(seriesRow.cta_sessions),
+      }));
+      const breakdown: Record<BreakdownRow['dimension'], BreakdownItem[]> = {
+        source: [],
+        campaign: [],
+        device: [],
+      };
+      for (const breakdownRow of breakdownResult.rows) {
+        const rowVisits = Number(breakdownRow.visits);
+        const rowCta = Number(breakdownRow.cta_sessions);
+        breakdown[breakdownRow.dimension].push({
+          key: breakdownRow.dim_key,
+          visits: rowVisits,
+          ctaSessions: rowCta,
+          ctaPct: percentOf(rowCta, rowVisits),
+        });
+      }
+
       await reply.send({
-        range: queryObject.data.range,
+        range,
         sessions,
         pageViews,
         ctaClicks: Number(row?.cta_clicks ?? 0),
@@ -658,6 +906,9 @@ export function registerRoutes(app: FastifyInstance, dependencies: RouteDependen
               : Number(section.average_visible_ms),
           };
         }),
+        kpis,
+        series,
+        breakdown,
       });
     },
   );
